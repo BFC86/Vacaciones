@@ -1,0 +1,1343 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Carolo Investment · Ausencias</title>
+
+  <!-- MSAL 2.x -->
+  <script src="https://unpkg.com/@azure/msal-browser@2.38.2/lib/msal-browser.js"></script>
+  <!-- React -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel (para JSX en CDN) -->
+  <script src="https://unpkg.com/@babel/standalone@7.23.4/babel.min.js"></script>
+  <!-- Tailwind -->
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f3f4f6; }
+    .pb-safe { padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+    .hide-scrollbar::-webkit-scrollbar { display: none; }
+    input[type="date"]::-webkit-inner-spin-button,
+    input[type="date"]::-webkit-calendar-picker-indicator { opacity: 1; cursor: pointer; }
+    .card { background: white; border-radius: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+    .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    // ════════════════════════════════════════════════════════════════════
+    //  ⚙️  CONFIGURACIÓN  —  Rellena estos valores antes de usar la app
+    // ════════════════════════════════════════════════════════════════════
+    const CONFIG = {
+      // Azure AD  →  portal.azure.com > Azure Active Directory > Registros de aplicaciones
+      tenantId:  'b44ac7dc-72fc-4d34-ad22-50c199e365f9',
+      clientId:  'f4ec23f2-dacd-4e05-9441-a71e2b87ba69',
+
+      // SharePoint
+      siteHostname: 'caroloinvestment.sharepoint.com',
+      sitePath:     '/sites/vacacionescaroloinvestments',
+      listName:     'Lista de vacaciones',
+
+      // Roles de aprobación  →  pon los emails de Microsoft de cada persona
+      preApprovers: ['bf@caroloinvestment.com'],           // 1ª aprobación (Bego)
+      finalApprovers: ['bf@caroloinvestment.com'],          // 2ª aprobación (provisional — cambiar por email de CIO)
+
+      // ID del grupo de Office 365 donde se crea el calendario (Vacaciones Carolo Investments)
+      calendarGroupId: '227d6ee6-bb5f-4c88-936d-297bb91a51eb',
+    };
+
+    // ──────────────────────────────────────────────────────────────────
+    //  Días de vacaciones
+    // ──────────────────────────────────────────────────────────────────
+    const DIAS_ANUALES = 23;
+    // Tipos que NO descuentan días de vacaciones
+    const TIPOS_SIN_DESCUENTO = ['Asuntos propios', 'Teletrabajo', 'Formación', 'Otro'];
+
+    // Equipo completo
+    const EQUIPO = [
+      { nombre: 'Begoña Fraiz',         email: 'bf@caroloinvestment.com', sinLimite: false },
+      { nombre: 'Ana Gordon',           email: 'ag@caroloinvestment.com', sinLimite: false },
+      { nombre: 'Pablo Giner',          email: 'pg@caroloinvestment.com', sinLimite: false },
+      { nombre: 'Susana Lara Valencia', email: null,                      sinLimite: false },
+      { nombre: 'Gonzalo Mazo',         email: null,                      sinLimite: false },
+      { nombre: 'Miguel Costales',      email: null,                      sinLimite: false },
+      { nombre: 'Nieves Benito',        email: 'nb@caroloinvestment.com', sinLimite: true  },
+      { nombre: 'Jesús Cabedo',         email: 'jc@caroloinvestment.com', sinLimite: true  },
+      { nombre: 'Virginia Sánchez',     email: 'vs@signattura.com',       sinLimite: true  },
+    ];
+
+    function esSinLimite(nombre) {
+      const n = nombre?.toLowerCase() || '';
+      return EQUIPO.some(e => e.sinLimite && n.includes(e.nombre.split(' ')[0].toLowerCase()));
+    }
+
+    function matchEmpleado(itemNombre, equipoNombre) {
+      if (!itemNombre || !equipoNombre) return false;
+      const a = itemNombre.toLowerCase();
+      const b = equipoNombre.toLowerCase();
+      if (a === b) return true;
+      // Match por primer nombre como palabra completa (evita 'ana' dentro de 'Susana')
+      const firstName = b.split(' ')[0];
+      const regex = new RegExp(`\\b${firstName}\\b`);
+      return regex.test(a);
+    }
+
+    function calcularDias(items, nombreEmpleado) {
+      if (esSinLimite(nombreEmpleado)) return { sinLimite: true, usados: 0, restantes: null };
+      const año = new Date().getFullYear();
+      const usados = items
+        .filter(it =>
+          matchEmpleado(it.empleado, nombreEmpleado) &&
+          [ST.PENDIENTE, ST.PRE, ST.APROBADO].includes(it.estado) &&
+          it.fechaInicio?.startsWith(String(año)) &&
+          !TIPOS_SIN_DESCUENTO.includes(it.tipo)
+        )
+        .reduce((acc, it) => acc + countDays(it.fechaInicio, it.fechaFin), 0);
+      return { sinLimite: false, usados, restantes: Math.max(0, DIAS_ANUALES - usados) };
+    }
+
+    function alertaDiciembre(restantes) {
+      const hoy = new Date();
+      return hoy.getMonth() === 11 && hoy.getDate() >= 1 && restantes > 5;
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    //  Nombres internos de columnas en SharePoint (verificados)
+    // ──────────────────────────────────────────────────────────────────
+    const F = {
+      empleadoLookupId: 'EmpleadoLookupId',
+      fechaInicio:      'FechaInicio',
+      fechaFin:         'Fechafin',
+      tipoAusencia:     'Tipodeausencia',
+      estado:           'Estado',
+      titulo:           'Titulocalendario',
+      eventoId:         'EventoID',
+      horaInicio:       'Horainicio',
+      horaFin:          'Hoarafin',
+    };
+
+    const TIPOS_CON_HORAS = ['Asuntos propios', 'Otro'];
+
+    const TIPOS = ['Vacaciones', 'Baja médica', 'Asuntos propios', 'Teletrabajo', 'Formación', 'Otro'];
+
+    // Festivos Comunidad de Madrid 2026
+    const FESTIVOS = new Set([
+      '2026-01-01', // Año Nuevo
+      '2026-01-06', // Día de Reyes
+      '2026-04-02', // Jueves Santo
+      '2026-04-03', // Viernes Santo
+      '2026-05-01', // Día del Trabajador
+      '2026-05-15', // San Isidro (Madrid capital)
+      '2026-10-12', // Fiesta Nacional de España
+      '2026-11-02', // Día de Todos los Santos
+      '2026-11-09', // La Almudena (Madrid capital)
+      '2026-12-07', // Día de la Constitución Española
+      '2026-12-08', // Día de la Inmaculada Concepción
+      '2026-12-25', // Navidad
+    ]);
+    const ST = { PENDIENTE: 'Pendiente', PRE: 'Pre-aprobado', APROBADO: 'Aprobado', RECHAZADO: 'Rechazado' };
+
+    // ════════════════════════════════════════════════════════════════════
+    //  🔐  MSAL
+    // ════════════════════════════════════════════════════════════════════
+    const SCOPES = ['User.Read', 'Sites.ReadWrite.All', 'Calendars.ReadWrite'];
+
+    let msalApp = null;
+    const isConfigured = CONFIG.clientId !== 'TU_CLIENT_ID' && CONFIG.tenantId !== 'TU_TENANT_ID';
+
+    if (isConfigured) {
+      msalApp = new msal.PublicClientApplication({
+        auth: {
+          clientId:    CONFIG.clientId,
+          authority:   `https://login.microsoftonline.com/${CONFIG.tenantId}`,
+          redirectUri: window.location.href.split('?')[0].split('#')[0],
+        },
+        cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: false },
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  📡  Microsoft Graph API
+    // ════════════════════════════════════════════════════════════════════
+    async function getToken() {
+      const accounts = msalApp.getAllAccounts();
+      if (!accounts.length) throw new Error('Sin sesión');
+      try {
+        const r = await msalApp.acquireTokenSilent({ scopes: SCOPES, account: accounts[0] });
+        return r.accessToken;
+      } catch {
+        const r = await msalApp.acquireTokenPopup({ scopes: SCOPES });
+        return r.accessToken;
+      }
+    }
+
+    async function graph(method, path, body) {
+      const token = await getToken();
+      const res = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
+        method,
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`Graph ${res.status}: ${txt}`);
+      }
+      return method === 'DELETE' ? null : res.json();
+    }
+
+    // Caché de IDs para no recalcular en cada llamada
+    let _siteId, _listId;
+
+    async function getSiteId() {
+      if (_siteId) return _siteId;
+      const d = await graph('GET', `/sites/${CONFIG.siteHostname}:${CONFIG.sitePath}`);
+      _siteId = d.id;
+      return _siteId;
+    }
+
+    async function getListId() {
+      if (_listId) return _listId;
+      const sid = await getSiteId();
+      const d = await graph('GET', `/sites/${sid}/lists?$filter=displayName eq '${encodeURIComponent(CONFIG.listName)}'`);
+      if (!d.value?.length) throw new Error(`Lista "${CONFIG.listName}" no encontrada`);
+      _listId = d.value[0].id;
+      return _listId;
+    }
+
+    // Obtener ID de usuario en SharePoint (necesario para campo Persona)
+    async function getSpUserId(email) {
+      try {
+        const sid = await getSiteId();
+        const d = await graph('GET',
+          `/sites/${sid}/lists/User%20Information%20List/items?$filter=fields/EMail eq '${email}'&$expand=fields`
+        );
+        if (d.value?.length) return parseInt(d.value[0].id);
+      } catch {}
+      return null;
+    }
+
+    let _usersMap = null;
+    async function getUsersMap() {
+      if (_usersMap) return _usersMap;
+      try {
+        const sid = await getSiteId();
+        const d = await graph('GET', `/sites/${sid}/lists/User%20Information%20List/items?$expand=fields&$top=500`);
+        _usersMap = {};
+        d.value.forEach(u => { if (u.id && u.fields?.Title) _usersMap[u.id] = u.fields.Title; });
+      } catch(e) { _usersMap = {}; }
+      return _usersMap;
+    }
+
+    async function fetchItems() {
+      const sid = await getSiteId();
+      const lid = await getListId();
+      const [d, usersMap] = await Promise.all([
+        graph('GET', `/sites/${sid}/lists/${lid}/items?$expand=fields&$top=999`),
+        getUsersMap(),
+      ]);
+      return d.value.map(item => {
+        const f = item.fields || {};
+        const titulo = f[F.titulo] || '';
+        // Si no hay Titulocalendario, busca el nombre en la lista de usuarios de SharePoint
+        const empleadoNombre = titulo
+          ? extractNombre(titulo)
+          : (usersMap[f[F.empleadoLookupId]] || f['Title'] || `Usuario ${f[F.empleadoLookupId] || ''}`);
+        return {
+          id:          item.id,
+          empleado:    empleadoNombre,
+          lookupId:    f[F.empleadoLookupId] || '',
+          fechaInicio: f[F.fechaInicio]?.split('T')[0] || '',
+          fechaFin:    f[F.fechaFin]?.split('T')[0] || '',
+          tipo:        f[F.tipoAusencia] || '',
+          estado:      f[F.estado] || ST.PENDIENTE,
+          titulo:      titulo,
+          eventoId:    f[F.eventoId] || null,
+          horaInicio:  f[F.horaInicio] || null,
+          horaFin:     f[F.horaFin] || null,
+          destino:     extractDestino(titulo),
+        };
+      });
+    }
+
+    async function createSolicitud({ empleadoNombre, spUserId, fechaInicio, fechaFin, tipo, horaInicio, horaFin, destino }) {
+      const sid = await getSiteId();
+      const lid = await getListId();
+      const titulo = destino ? `${empleadoNombre} - ${tipo}: ${destino}` : `${empleadoNombre} - ${tipo}`;
+      const fields = {
+        [F.fechaInicio]:  fechaInicio,
+        [F.fechaFin]:     fechaFin,
+        [F.tipoAusencia]: tipo,
+        [F.estado]:       ST.PENDIENTE,
+        [F.titulo]:       titulo,
+      };
+      if (spUserId) fields[F.empleadoLookupId] = spUserId;
+      if (horaInicio) fields[F.horaInicio] = horaInicio;
+      if (horaFin)    fields[F.horaFin]    = horaFin;
+      // Para Asuntos propios/Otro la app gestiona el evento — bloqueamos PA desde el principio
+      if (TIPOS_CON_HORAS.includes(tipo)) fields['EventoCalendario'] = true;
+      return graph('POST', `/sites/${sid}/lists/${lid}/items`, { fields });
+    }
+
+    async function updateEstado(itemId, nuevoEstado) {
+      const sid = await getSiteId();
+      const lid = await getListId();
+      return graph('PATCH', `/sites/${sid}/lists/${lid}/items/${itemId}/fields`, {
+        [F.estado]: nuevoEstado,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  🛠️  Utilidades
+    // ════════════════════════════════════════════════════════════════════
+    function fmtDate(d) {
+      if (!d) return '—';
+      const [y, m, day] = d.split('-');
+      const months = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+      return `${parseInt(day)} ${months[parseInt(m)-1]} ${y}`;
+    }
+
+    function countDays(inicio, fin) {
+      if (!inicio || !fin) return 0;
+      let count = 0;
+      const d = new Date(inicio + 'T12:00:00');
+      const end = new Date(fin + 'T12:00:00');
+      while (d <= end) {
+        const day = d.getDay();
+        const ds = d.toISOString().split('T')[0];
+        if (day !== 0 && day !== 6 && !FESTIVOS.has(ds)) count++;
+        d.setDate(d.getDate() + 1);
+      }
+      return count;
+    }
+
+    function isFestivo(dateStr) {
+      return FESTIVOS.has(dateStr);
+    }
+
+    const BADGE_STYLE = {
+      [ST.PENDIENTE]:  { bg: '#FEF9C3', color: '#854D0E' },
+      [ST.PRE]:        { bg: '#FFEDD5', color: '#9A3412' },
+      [ST.APROBADO]:   { bg: '#DCFCE7', color: '#166534' },
+      [ST.RECHAZADO]:  { bg: '#FEE2E2', color: '#991B1B' },
+    };
+
+    function Badge({ estado }) {
+      const s = BADGE_STYLE[estado] || { bg: '#F3F4F6', color: '#374151' };
+      return (
+        <span className="badge" style={{ background: s.bg, color: s.color }}>
+          {estado || 'Pendiente'}
+        </span>
+      );
+    }
+
+    function isPreApprover(email) {
+      return CONFIG.preApprovers.map(e => e.toLowerCase()).includes(email?.toLowerCase());
+    }
+    function isFinalApprover(email) {
+      return CONFIG.finalApprovers.map(e => e.toLowerCase()).includes(email?.toLowerCase());
+    }
+    function isAnyAdmin(email) {
+      return isPreApprover(email) || isFinalApprover(email);
+    }
+
+    // Paleta de colores para el calendario — uno fijo por persona del EQUIPO
+    const PALETTE = ['#3B82F6','#10B981','#8B5CF6','#F59E0B','#EF4444','#06B6D4','#EC4899','#F97316','#84CC16'];
+    const EQUIPO_COLORS = {};
+    EQUIPO.forEach((m, i) => { EQUIPO_COLORS[m.nombre] = PALETTE[i % PALETTE.length]; });
+
+    function colorDeEmpleado(nombreItem) {
+      // Busca el miembro del equipo que mejor coincide con el nombre del item
+      const match = EQUIPO.find(m => matchEmpleado(nombreItem, m.nombre));
+      return match ? EQUIPO_COLORS[match.nombre] : '#6B7280';
+    }
+
+    function extractDestino(titulo) {
+      if (!titulo) return '';
+      const partes = titulo.split(/\s[–\-]\s/);
+      if (partes.length < 2) return '';
+      const idx = partes[1].indexOf(':');
+      return idx >= 0 ? partes[1].slice(idx + 1).trim() : '';
+    }
+
+    function extractNombre(titulo) {
+      if (!titulo) return '';
+      // Intenta dividir por guión o raya con espacios
+      const partes = titulo.split(/\s[–\-]\s/);
+      if (partes.length > 1) return partes[0].trim();
+      // Fallback: elimina el tipo conocido del final
+      for (const tipo of TIPOS) {
+        if (titulo.endsWith(' ' + tipo)) return titulo.slice(0, -(tipo.length + 1)).trim();
+        if (titulo.endsWith(tipo)) return titulo.slice(0, -tipo.length).trim();
+      }
+      return titulo;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  🎨  ICONOS
+    // ════════════════════════════════════════════════════════════════════
+    const IcoHome = () => (
+      <svg width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+        <path d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+      </svg>
+    );
+    const IcoPlus = () => (
+      <svg width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>
+      </svg>
+    );
+    const IcoList = () => (
+      <svg width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+        <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+      </svg>
+    );
+    const IcoCal = () => (
+      <svg width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+      </svg>
+    );
+    const IcoCheck = () => (
+      <svg width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+        <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+      </svg>
+    );
+    const IcoLogout = () => (
+      <svg width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" viewBox="0 0 24 24">
+        <path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+      </svg>
+    );
+
+    // ════════════════════════════════════════════════════════════════════
+    //  📄  PANTALLA: Setup / Configuración pendiente
+    // ════════════════════════════════════════════════════════════════════
+    function SetupScreen() {
+      return (
+        <div style={{ minHeight: '100vh', background: 'linear-gradient(135deg,#1E40AF 0%,#3B82F6 100%)' }}
+             className="flex flex-col items-center justify-center p-6">
+          <div className="w-full max-w-sm">
+            <div className="text-center mb-8">
+              <div className="text-white font-bold text-5xl mb-2">CI</div>
+              <h1 className="text-white text-2xl font-semibold">Carolo Investment</h1>
+              <p className="text-blue-200 mt-1">Gestión de ausencias</p>
+            </div>
+            <div className="card p-6">
+              <h2 className="text-lg font-bold text-gray-800 mb-3">⚙️ Configuración pendiente</h2>
+              <p className="text-gray-600 text-sm mb-4">
+                Antes de usar la app, edita el archivo <code className="bg-gray-100 px-1 rounded text-xs">vacaciones-app.html</code> y rellena los valores de la sección <strong>CONFIG</strong>:
+              </p>
+              <ol className="text-sm text-gray-700 space-y-2">
+                <li className="flex gap-2"><span className="font-bold text-blue-600">1.</span>
+                  <span>Registra la app en <strong>portal.azure.com</strong> → Azure Active Directory → Registros de aplicaciones</span>
+                </li>
+                <li className="flex gap-2"><span className="font-bold text-blue-600">2.</span>
+                  <span>Copia el <strong>ID de directorio (tenant)</strong> y el <strong>ID de aplicación (client)</strong></span>
+                </li>
+                <li className="flex gap-2"><span className="font-bold text-blue-600">3.</span>
+                  <span>En la app registrada, añade el permiso delegado <strong>Sites.ReadWrite.All</strong> (Microsoft Graph)</span>
+                </li>
+                <li className="flex gap-2"><span className="font-bold text-blue-600">4.</span>
+                  <span>En "Autenticación", añade como URI de redirección la URL donde sirves este archivo. Para probar localmente: <code className="bg-gray-100 px-1 rounded text-xs">http://localhost:8000/vacaciones-app.html</code></span>
+                </li>
+                <li className="flex gap-2"><span className="font-bold text-blue-600">5.</span>
+                  <span>Actualiza el email de la CIO en <code className="bg-gray-100 px-1 rounded text-xs">finalApprovers</code></span>
+                </li>
+              </ol>
+              <div className="mt-4 bg-blue-50 rounded-lg p-3 text-xs text-blue-700">
+                💡 Para servir el archivo localmente: abre una terminal en la carpeta y ejecuta <code>python -m http.server 8000</code>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  📄  PANTALLA: Login
+    // ════════════════════════════════════════════════════════════════════
+    function LoginScreen({ onLogin }) {
+      return (
+        <div style={{ minHeight: '100vh', background: 'linear-gradient(135deg,#1E40AF 0%,#3B82F6 100%)' }}
+             className="flex flex-col items-center justify-center p-6">
+          <div className="w-full max-w-sm">
+            <div className="text-center mb-10">
+              <div className="text-white font-bold text-5xl mb-2">CI</div>
+              <h1 className="text-white text-2xl font-semibold">Carolo Investment</h1>
+              <p className="text-blue-200 mt-1">Gestión de ausencias</p>
+            </div>
+            <div className="card p-6">
+              <h2 className="text-center text-gray-800 font-semibold text-lg mb-1">Iniciar sesión</h2>
+              <p className="text-center text-gray-500 text-sm mb-6">Con tu cuenta de empresa</p>
+              <button
+                onClick={onLogin}
+                className="w-full text-white font-semibold rounded-xl py-3 flex items-center justify-center gap-3 transition-opacity hover:opacity-90"
+                style={{ background: '#2563EB' }}
+              >
+                <svg width="20" height="20" viewBox="0 0 21 21" fill="white">
+                  <rect x="1" y="1" width="9" height="9"/>
+                  <rect x="11" y="1" width="9" height="9"/>
+                  <rect x="1" y="11" width="9" height="9"/>
+                  <rect x="11" y="11" width="9" height="9"/>
+                </svg>
+                Entrar con Microsoft
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  🔝  BARRA SUPERIOR
+    // ════════════════════════════════════════════════════════════════════
+    function TopBar({ user, onLogout }) {
+      const name = user?.givenName || user?.displayName?.split(' ')[0] || 'Hola';
+      return (
+        <div style={{ background: '#1E40AF' }} className="px-4 py-3 flex items-center justify-between sticky top-0 z-10">
+          <div>
+            <p className="text-white font-semibold text-sm">Hola, {name} 👋</p>
+            <p className="text-blue-300 text-xs">{user?.mail}</p>
+          </div>
+          <button onClick={onLogout}
+            className="p-2 rounded-full text-white hover:bg-blue-700 transition-colors">
+            <IcoLogout />
+          </button>
+        </div>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  ⬇️  NAV INFERIOR
+    // ════════════════════════════════════════════════════════════════════
+    function BottomNav({ page, setPage, adminUser }) {
+      const tabs = [
+        { id: 'home',       label: 'Inicio',    Icon: IcoHome  },
+        { id: 'nueva',      label: 'Solicitar', Icon: IcoPlus  },
+        { id: 'mis',        label: 'Mis pedidos', Icon: IcoList  },
+        { id: 'calendario', label: 'Equipo',    Icon: IcoCal   },
+        ...(adminUser ? [{ id: 'aprobar', label: 'Aprobar', Icon: IcoCheck }] : []),
+      ];
+      return (
+        <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 pb-safe z-20"
+             style={{ boxShadow: '0 -1px 10px rgba(0,0,0,0.08)' }}>
+          <div className="flex">
+            {tabs.map(({ id, label, Icon }) => {
+              const active = page === id;
+              return (
+                <button key={id} onClick={() => setPage(id)}
+                  className="flex-1 py-2 flex flex-col items-center gap-0.5 transition-colors"
+                  style={{ color: active ? '#2563EB' : '#9CA3AF' }}>
+                  <Icon />
+                  <span style={{ fontSize: 10, fontWeight: active ? 600 : 400 }}>{label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  🏠  INICIO / Dashboard
+    // ════════════════════════════════════════════════════════════════════
+    function HomePage({ items, user }) {
+      const nombre = user?.displayName || '';
+      const myItems = items.filter(it => it.empleado && nombre && it.empleado.toLowerCase() === nombre.toLowerCase());
+      const { sinLimite, usados, restantes } = calcularDias(items, nombre);
+      const pendientesCount = myItems.filter(it => [ST.PENDIENTE, ST.PRE].includes(it.estado)).length;
+      const alerta = !sinLimite && alertaDiciembre(restantes);
+      const año = new Date().getFullYear();
+
+      const hoy = new Date().toISOString().split('T')[0];
+      const proximas = items
+        .filter(it => it.estado === ST.APROBADO && it.fechaFin >= hoy)
+        .sort((a, b) => a.fechaInicio.localeCompare(b.fechaInicio))
+        .slice(0, 6);
+
+      return (
+        <div className="p-4 space-y-4">
+          <h2 className="text-lg font-bold text-gray-800">Resumen {año}</h2>
+
+          {/* Alerta diciembre */}
+          {alerta && (
+            <div className="rounded-xl p-3 text-sm font-medium" style={{ background: '#FEF3C7', color: '#92400E', border: '1px solid #FCD34D' }}>
+              ⚠️ Te quedan <strong>{restantes} días</strong> de vacaciones. Recuerda que tienes hasta el 7 de enero para usarlos.
+            </div>
+          )}
+
+          {/* Contador de días */}
+          {sinLimite ? (
+            <div className="card p-4 text-center">
+              <p className="text-sm text-gray-500 font-medium">Días sin límite ✨</p>
+            </div>
+          ) : (
+            <div className="card p-4">
+              <div className="flex justify-between items-center mb-2">
+                <span className="text-sm font-medium text-gray-600">Días de vacaciones {año}</span>
+                <span className="text-sm font-bold" style={{ color: restantes <= 5 ? '#DC2626' : '#16A34A' }}>
+                  {restantes} restantes
+                </span>
+              </div>
+              <div className="w-full rounded-full h-2 bg-gray-100">
+                <div className="h-2 rounded-full transition-all" style={{
+                  width: `${Math.min(100, (usados / DIAS_ANUALES) * 100)}%`,
+                  background: restantes <= 5 ? '#DC2626' : '#2563EB'
+                }} />
+              </div>
+              <div className="flex justify-between text-xs text-gray-400 mt-1">
+                <span>{usados} usados</span>
+                <span>{DIAS_ANUALES} totales · hasta 7 ene {año + 1}</span>
+              </div>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="card p-4">
+              <p className="text-3xl font-bold" style={{ color: '#2563EB' }}>{usados}</p>
+              <p className="text-xs text-gray-500 mt-1 font-medium">Días solicitados</p>
+            </div>
+            <div className="card p-4">
+              <p className="text-3xl font-bold text-yellow-600">{pendientesCount}</p>
+              <p className="text-xs text-gray-500 mt-1 font-medium">Pendientes</p>
+            </div>
+          </div>
+
+          <h3 className="text-sm font-semibold text-gray-700">Próximas ausencias del equipo</h3>
+
+          {proximas.length === 0 ? (
+            <p className="text-center text-gray-400 text-sm py-6">No hay ausencias próximas</p>
+          ) : (
+            <div className="space-y-2">
+              {proximas.map(it => (
+                <div key={it.id} className="card p-3 flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">{it.empleado}</p>
+                    <p className="text-xs text-gray-500">{it.tipo}{it.destino ? `: ${it.destino}` : ''} · {fmtDate(it.fechaInicio)} → {fmtDate(it.fechaFin)}</p>
+                  </div>
+                  <Badge estado={it.estado} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  ➕  NUEVA SOLICITUD
+    // ════════════════════════════════════════════════════════════════════
+    function NuevaSolicitudPage({ user, spUserId, onSubmit, items }) {
+      const [form, setForm] = React.useState({ tipo: 'Vacaciones', inicio: '', fin: '', destino: '', todoElDia: true, horaInicio: '09:00', horaFin: '18:00' });
+      const [loading, setLoading] = React.useState(false);
+      const [msg, setMsg] = React.useState(null); // { type: 'ok'|'err', text }
+
+      const set = k => e => setForm(f => ({ ...f, [k]: e.target.value }));
+      const tieneHoras = TIPOS_CON_HORAS.includes(form.tipo);
+
+      const nombre = user?.displayName || '';
+      const descuenta = !TIPOS_SIN_DESCUENTO.includes(form.tipo);
+      const dias = form.inicio && form.fin ? countDays(form.inicio, form.fin) : 0;
+      const { sinLimite, restantes } = calcularDias(items, nombre);
+      const restantesTras = sinLimite ? null : Math.max(0, (restantes || 0) - (descuenta ? dias : 0));
+      const sinDias = !sinLimite && descuenta && dias > (restantes || 0);
+
+      const submit = async e => {
+        e.preventDefault();
+        if (!form.inicio || !form.fin) { setMsg({ type: 'err', text: 'Selecciona las fechas de inicio y fin.' }); return; }
+        if (form.fin < form.inicio)    { setMsg({ type: 'err', text: 'La fecha de fin no puede ser anterior al inicio.' }); return; }
+        if (tieneHoras && !form.todoElDia && form.horaFin <= form.horaInicio) { setMsg({ type: 'err', text: 'La hora de fin debe ser posterior a la de inicio.' }); return; }
+
+        setLoading(true);
+        setMsg(null);
+        try {
+          await createSolicitud({
+            empleadoNombre: user.displayName,
+            spUserId,
+            fechaInicio:  form.inicio,
+            fechaFin:     form.fin,
+            tipo:         form.tipo,
+            destino:      form.destino,
+            horaInicio:   (tieneHoras && !form.todoElDia) ? form.horaInicio : null,
+            horaFin:      (tieneHoras && !form.todoElDia) ? form.horaFin    : null,
+          });
+          setMsg({ type: 'ok', text: '✅ Solicitud enviada. Pendiente de aprobación.' });
+          setForm({ tipo: 'Vacaciones', inicio: '', fin: '', destino: '', todoElDia: true, horaInicio: '09:00', horaFin: '18:00' });
+          onSubmit();
+        } catch (err) {
+          console.error(err);
+          setMsg({ type: 'err', text: 'Error al enviar. Comprueba la conexión o los permisos.' });
+        }
+        setLoading(false);
+      };
+
+      return (
+        <div className="p-4">
+          <h2 className="text-lg font-bold text-gray-800 mb-4">Nueva solicitud</h2>
+
+          {msg && (
+            <div className={`rounded-xl p-3 mb-4 text-sm ${msg.type === 'ok' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
+              {msg.text}
+            </div>
+          )}
+
+          <form onSubmit={submit} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Tipo de ausencia</label>
+              <select value={form.tipo} onChange={set('tipo')}
+                className="w-full border border-gray-200 rounded-xl px-3 py-3 text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                {TIPOS.map(t => <option key={t}>{t}</option>)}
+              </select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Fecha inicio</label>
+                <input type="date" value={form.inicio} onChange={set('inicio')}
+                  className="w-full border border-gray-200 rounded-xl px-3 py-3 text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Fecha fin</label>
+                <input type="date" value={form.fin} min={form.inicio} onChange={set('fin')}
+                  className="w-full border border-gray-200 rounded-xl px-3 py-3 text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+              </div>
+            </div>
+
+            {/* Selector de tramo horario para Asuntos propios / Otro */}
+            {tieneHoras && (
+              <div className="card p-3 space-y-3" style={{ background: '#F8FAFC' }}>
+                <div className="flex items-center gap-3">
+                  <button type="button"
+                    onClick={() => setForm(f => ({ ...f, todoElDia: true }))}
+                    className={`flex-1 py-2 rounded-xl text-sm font-medium transition-colors border ${form.todoElDia ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-500'}`}>
+                    🗓 Todo el día
+                  </button>
+                  <button type="button"
+                    onClick={() => setForm(f => ({ ...f, todoElDia: false }))}
+                    className={`flex-1 py-2 rounded-xl text-sm font-medium transition-colors border ${!form.todoElDia ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-white text-gray-500'}`}>
+                    🕐 Tramo horario
+                  </button>
+                </div>
+                {!form.todoElDia && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500 mb-1">Hora inicio</label>
+                      <input type="time" value={form.horaInicio} onChange={set('horaInicio')}
+                        className="w-full border border-gray-200 rounded-xl px-3 py-2 text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500 mb-1">Hora fin</label>
+                      <input type="time" value={form.horaFin} onChange={set('horaFin')}
+                        className="w-full border border-gray-200 rounded-xl px-3 py-2 text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                    </div>
+                  </div>
+                )}
+                <p className="text-xs text-gray-400">Se creará un evento privado en el calendario con el aprobador.</p>
+              </div>
+            )}
+
+            {sinDias && (
+              <div className="rounded-xl p-3 text-sm text-center font-medium" style={{ background: '#FEE2E2', color: '#991B1B' }}>
+                ⚠️ No tienes suficientes días disponibles ({restantes} restantes)
+              </div>
+            )}
+
+            {dias > 0 && (
+              <div className="rounded-xl p-3 text-sm text-center font-medium"
+                   style={{ background: descuenta ? '#EFF6FF' : '#F0FDF4', color: descuenta ? '#1E40AF' : '#166534' }}>
+                {descuenta ? (
+                  <>
+                    {dias} día{dias !== 1 ? 's' : ''} laborable{dias !== 1 ? 's' : ''}
+                    {!sinLimite && <span className="ml-1 text-xs opacity-70">(te quedarán {restantesTras})</span>}
+                  </>
+                ) : (
+                  <>✓ {dias} día{dias !== 1 ? 's' : ''} · no descuenta vacaciones</>
+                )}
+                {(() => {
+                  // Contar festivos en el rango
+                  let festivos = 0;
+                  const d = new Date(form.inicio + 'T12:00:00');
+                  const end = new Date(form.fin + 'T12:00:00');
+                  while (d <= end) {
+                    const day = d.getDay();
+                    const ds = d.toISOString().split('T')[0];
+                    if (day !== 0 && day !== 6 && FESTIVOS.has(ds)) festivos++;
+                    d.setDate(d.getDate() + 1);
+                  }
+                  return festivos > 0 ? (
+                    <div className="text-xs mt-1" style={{ color: '#DC2626' }}>
+                      ({festivos} festivo{festivos !== 1 ? 's' : ''} excluido{festivos !== 1 ? 's' : ''})
+                    </div>
+                  ) : null;
+                })()}
+              </div>
+            )}
+
+            {TIPOS_SIN_DESCUENTO.includes(form.tipo) && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  ¿Dónde vas? <span className="text-gray-400 font-normal">(opcional)</span>
+                </label>
+                <input
+                  type="text"
+                  value={form.destino}
+                  onChange={set('destino')}
+                  placeholder="Ej: Médico, formación en Madrid..."
+                  className="w-full border border-gray-200 rounded-xl px-3 py-3 text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+            )}
+
+            <button type="submit" disabled={loading || sinDias}
+              className="w-full text-white font-semibold rounded-xl py-3 transition-opacity disabled:opacity-50"
+              style={{ background: '#2563EB' }}>
+              {loading ? 'Enviando...' : 'Enviar solicitud'}
+            </button>
+          </form>
+        </div>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  📋  MIS SOLICITUDES
+    // ════════════════════════════════════════════════════════════════════
+    function MisSolicitudesPage({ items, user, onRefresh }) {
+      const nombre = user?.displayName || '';
+      const myItems = items
+        .filter(it => it.empleado?.toLowerCase() === nombre.toLowerCase())
+        .sort((a, b) => b.fechaInicio.localeCompare(a.fechaInicio));
+
+      const [editando, setEditando] = React.useState(null);
+      const [editForm, setEditForm] = React.useState({});
+      const [saving, setSaving] = React.useState(false);
+      const [msg, setMsg] = React.useState(null);
+      const [confirmDelete, setConfirmDelete] = React.useState(false);
+
+      const abrirEdicion = (it) => {
+        setEditando(it.id);
+        setEditForm({ tipo: it.tipo, inicio: it.fechaInicio, fin: it.fechaFin });
+        setMsg(null);
+      };
+
+      const guardarEdicion = async () => {
+        if (!editForm.inicio || !editForm.fin) return;
+        if (editForm.fin < editForm.inicio) { setMsg({ type: 'err', text: 'La fecha de fin no puede ser anterior al inicio.' }); return; }
+        setSaving(true);
+        try {
+          const item = myItems.find(i => i.id === editando);
+          const titulo = `${nombre} – ${editForm.tipo}`;
+          await graph('PATCH',
+            `/sites/${await getSiteId()}/lists/${await getListId()}/items/${editando}/fields`,
+            {
+              [F.fechaInicio]:  editForm.inicio,
+              [F.fechaFin]:     editForm.fin,
+              [F.tipoAusencia]: editForm.tipo,
+              [F.estado]:       ST.PENDIENTE, // vuelve a pendiente al editar
+              [F.titulo]:       titulo,
+            }
+          );
+          setEditando(null);
+          onRefresh();
+        } catch(e) {
+          setMsg({ type: 'err', text: 'Error al guardar. Inténtalo de nuevo.' });
+        }
+        setSaving(false);
+      };
+
+      const eliminar = async () => {
+        setSaving(true);
+        try {
+          const item = myItems.find(i => i.id === editando);
+          // Si tiene evento en el calendario, borrarlo primero
+          if (item?.eventoId) {
+            try {
+              await graph('DELETE', `/groups/${CONFIG.calendarGroupId}/events/${item.eventoId}`);
+            } catch(e) {
+              console.warn('No se pudo borrar el evento del calendario:', e);
+            }
+          }
+          await graph('DELETE', `/sites/${await getSiteId()}/lists/${await getListId()}/items/${editando}`);
+          setEditando(null);
+          setConfirmDelete(false);
+          onRefresh();
+        } catch(e) {
+          setMsg({ type: 'err', text: 'Error al eliminar. Inténtalo de nuevo.' });
+        }
+        setSaving(false);
+      };
+
+      const cancelarEdicion = () => { setEditando(null); setMsg(null); setConfirmDelete(false); };
+      const setEF = k => e => setEditForm(f => ({ ...f, [k]: e.target.value }));
+      const diasEdicion = editForm.inicio && editForm.fin ? countDays(editForm.inicio, editForm.fin) : 0;
+      const puedeEditar = (it) => true; // todas son editables
+
+      return (
+        <div className="p-4">
+          <h2 className="text-lg font-bold text-gray-800 mb-4">Mis solicitudes</h2>
+          {myItems.length === 0 ? (
+            <div className="text-center py-16 text-gray-400">
+              <div className="text-4xl mb-3">📭</div>
+              <p className="text-sm">No tienes solicitudes todavía</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {myItems.map(it => (
+                <div key={it.id} className="card p-4">
+                  {editando === it.id ? (
+                    // ── Modo edición ──
+                    <div className="space-y-3">
+                      <p className="text-sm font-semibold text-gray-700">Editando solicitud</p>
+                      {msg && <div className="text-xs text-red-600 bg-red-50 rounded-lg p-2">{msg.text}</div>}
+                      <select value={editForm.tipo} onChange={setEF('tipo')}
+                        className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-800 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        {TIPOS.map(t => <option key={t}>{t}</option>)}
+                      </select>
+                      <div className="grid grid-cols-2 gap-2">
+                        <input type="date" value={editForm.inicio} onChange={setEF('inicio')}
+                          className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                        <input type="date" value={editForm.fin} min={editForm.inicio} onChange={setEF('fin')}
+                          className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                      </div>
+                      {diasEdicion > 0 && (
+                        <p className="text-xs text-center text-blue-600 font-medium">{diasEdicion} días laborables</p>
+                      )}
+                      <div className="flex gap-2">
+                        <button onClick={guardarEdicion} disabled={saving}
+                          className="flex-1 text-white text-sm font-semibold rounded-xl py-2 disabled:opacity-50"
+                          style={{ background: '#2563EB' }}>
+                          {saving ? 'Guardando...' : 'Guardar'}
+                        </button>
+                        <button onClick={cancelarEdicion} disabled={saving}
+                          className="flex-1 text-gray-600 text-sm font-semibold rounded-xl py-2 border border-gray-200">
+                          Cancelar
+                        </button>
+                      </div>
+
+                      {/* Eliminar */}
+                      {!confirmDelete ? (
+                        <button onClick={() => setConfirmDelete(true)}
+                          className="w-full text-red-500 text-xs font-medium py-2 rounded-xl border border-red-200 hover:bg-red-50 transition-colors">
+                          🗑️ Eliminar solicitud
+                        </button>
+                      ) : (
+                        <div className="rounded-xl p-3 text-center" style={{ background: '#FEE2E2' }}>
+                          <p className="text-sm font-semibold text-red-700 mb-2">¿Segura que quieres eliminarla?</p>
+                          <div className="flex gap-2">
+                            <button onClick={eliminar} disabled={saving}
+                              className="flex-1 text-white text-sm font-semibold rounded-lg py-2 disabled:opacity-50"
+                              style={{ background: '#DC2626' }}>
+                              {saving ? '...' : 'Sí, eliminar'}
+                            </button>
+                            <button onClick={() => setConfirmDelete(false)}
+                              className="flex-1 text-gray-600 text-sm font-semibold rounded-lg py-2 bg-white border border-gray-200">
+                              No
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      <p className="text-xs text-gray-400 text-center">⚠️ Al editar, la solicitud vuelve a Pendiente y necesitará aprobarse de nuevo</p>
+                    </div>
+                  ) : (
+                    // ── Modo vista ──
+                    <>
+                      <div className="flex items-start justify-between mb-1">
+                        <p className="font-semibold text-gray-800">{it.tipo}</p>
+                        <Badge estado={it.estado} />
+                      </div>
+                      {it.destino && <p className="text-sm text-blue-600 mb-0.5">📍 {it.destino}</p>}
+                      <p className="text-sm text-gray-500">
+                        {fmtDate(it.fechaInicio)} → {fmtDate(it.fechaFin)}
+                        <span className="ml-2 text-gray-400">({countDays(it.fechaInicio, it.fechaFin)} días)</span>
+                      </p>
+                      {puedeEditar(it) && (
+                        <button onClick={() => abrirEdicion(it)}
+                          className="mt-2 text-xs font-medium px-3 py-1 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors">
+                          ✏️ Modificar
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  📅  CALENDARIO DEL EQUIPO
+    // ════════════════════════════════════════════════════════════════════
+    function CalendarioPage({ items }) {
+      const now = new Date();
+      const [year, setYear]   = React.useState(now.getFullYear());
+      const [month, setMonth] = React.useState(now.getMonth());
+
+      const MESES  = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+      const DIAS   = ['L','M','X','J','V','S','D'];
+
+      const firstDay    = new Date(year, month, 1);
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      const startOffset = (firstDay.getDay() + 6) % 7; // Lunes = 0
+
+      const cells = [];
+      for (let i = 0; i < startOffset; i++) cells.push(null);
+      for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+      const approved = items.filter(it => it.estado === ST.APROBADO);
+
+      function absencesForDay(day) {
+        if (!day) return [];
+        const ds = `${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+        return approved.filter(it => it.fechaInicio && it.fechaFin && ds >= it.fechaInicio && ds <= it.fechaFin);
+      }
+
+      const today = new Date();
+
+      const prevMonth = () => { if (month === 0) { setMonth(11); setYear(y => y-1); } else { setMonth(m => m-1); } };
+      const nextMonth = () => { if (month === 11) { setMonth(0);  setYear(y => y+1); } else { setMonth(m => m+1); } };
+
+      return (
+        <div className="p-4">
+          {/* Cabecera */}
+          <div className="flex items-center justify-between mb-4">
+            <button onClick={prevMonth} className="p-2 rounded-full hover:bg-gray-100 text-gray-600">◀</button>
+            <h2 className="text-base font-bold text-gray-800">{MESES[month]} {year}</h2>
+            <button onClick={nextMonth} className="p-2 rounded-full hover:bg-gray-100 text-gray-600">▶</button>
+          </div>
+
+          {/* Días de la semana */}
+          <div className="grid grid-cols-7 mb-1">
+            {DIAS.map(d => (
+              <div key={d} className="text-center text-xs font-semibold text-gray-400 py-1">{d}</div>
+            ))}
+          </div>
+
+          {/* Celdas */}
+          <div className="grid grid-cols-7 gap-1">
+            {cells.map((day, idx) => {
+              const abs = absencesForDay(day);
+              const isToday = day &&
+                year  === today.getFullYear() &&
+                month === today.getMonth() &&
+                day   === today.getDate();
+
+              const dateStr = day ? `${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}` : '';
+              const festivo = day && isFestivo(dateStr);
+              return (
+                <div key={idx}
+                  className={`rounded-lg overflow-hidden ${day ? (festivo ? 'bg-red-50' : 'bg-white shadow-sm') : ''}`}
+                  style={{ minHeight: 52, border: isToday ? '2px solid #2563EB' : '2px solid transparent' }}>
+                  {day && (
+                    <>
+                      <div className={`text-center text-xs font-medium pt-1 ${isToday ? 'text-blue-600' : festivo ? 'text-red-400' : 'text-gray-600'}`}>
+                        {day}
+                      </div>
+                      {abs.slice(0, 2).map((it, i) => (
+                        <div key={i}
+                          style={{ background: colorDeEmpleado(it.empleado), fontSize: 9 }}
+                          className="text-white px-1 truncate leading-4 mt-0.5" title={it.empleado}>
+                          {it.empleado?.split(' ')[0]}
+                        </div>
+                      ))}
+                      {abs.length > 2 && (
+                        <div className="text-center text-gray-400" style={{ fontSize: 9 }}>+{abs.length - 2}</div>
+                      )}
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Leyenda */}
+          <div className="mt-4">
+            <p className="text-xs font-semibold text-gray-500 mb-2">Leyenda</p>
+            <div className="flex flex-wrap gap-2">
+              {EQUIPO.map(miembro => (
+                <div key={miembro.nombre} className="flex items-center gap-1">
+                  <div className="w-3 h-3 rounded-sm flex-shrink-0" style={{ background: EQUIPO_COLORS[miembro.nombre] }} />
+                  <span className="text-xs text-gray-600">{miembro.nombre.split(' ')[0]}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Estado del equipo */}
+          <div className="mt-6">
+            <p className="text-sm font-bold text-gray-700 mb-3">Estado del equipo {new Date().getFullYear()}</p>
+            <div className="space-y-2">
+              {EQUIPO.map(miembro => {
+                const { sinLimite, usados, restantes } = calcularDias(items, miembro.nombre);
+                const color = sinLimite ? '#9CA3AF'
+                  : restantes <= 5 ? '#DC2626'
+                  : restantes <= 10 ? '#F59E0B'
+                  : '#16A34A';
+                return (
+                  <div key={miembro.nombre} className="card px-3 py-2 flex items-center justify-between">
+                    <span className="text-sm text-gray-700">{miembro.nombre.split(' ')[0]} {miembro.nombre.split(' ')[1] || ''}</span>
+                    {sinLimite ? (
+                      <span className="text-xs text-gray-400">Sin límite</span>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <div className="w-20 h-1.5 rounded-full bg-gray-100">
+                          <div className="h-1.5 rounded-full" style={{
+                            width: `${Math.min(100,(usados/DIAS_ANUALES)*100)}%`,
+                            background: color
+                          }} />
+                        </div>
+                        <span className="text-xs font-medium" style={{ color }}>
+                          {restantes} libres
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  ✅  PANEL DE APROBACIONES
+    // ════════════════════════════════════════════════════════════════════
+    function AprobacionesPage({ items, user, onRefresh }) {
+      const email = user?.mail?.toLowerCase();
+      const esPre   = isPreApprover(email);
+      const esFinal = isFinalApprover(email);
+      const [busy, setBusy] = React.useState({});
+
+      // Filtra lo que puede ver este usuario
+      const pendientes = items.filter(it => {
+        if (esPre && !esFinal) return it.estado === ST.PENDIENTE;
+        if (esFinal && !esPre) return it.estado === ST.PRE;
+        // Si es ambos, ve las dos colas
+        return [ST.PENDIENTE, ST.PRE].includes(it.estado);
+      }).sort((a, b) => a.fechaInicio.localeCompare(b.fechaInicio));
+
+      const accion = async (id, aprobar) => {
+        setBusy(b => ({ ...b, [id]: true }));
+        try {
+          if (aprobar) {
+            const item = items.find(i => i.id === id);
+            const siguiente = item.estado === ST.PENDIENTE ? ST.PRE : ST.APROBADO;
+
+            await updateEstado(id, siguiente);
+
+            // Aprobación final → la app crea el evento (PA desactivado)
+            if (siguiente === ST.APROBADO) {
+              try {
+                const addDay = d => { const x = new Date(d + 'T00:00:00Z'); x.setUTCDate(x.getUTCDate()+1); return x.toISOString().split('T')[0]; };
+                const esTipoCon = TIPOS_CON_HORAS.includes(item.tipo);
+                const esTramo   = esTipoCon && !!(item.horaInicio && item.horaFin);
+                const miembro   = EQUIPO.find(m => matchEmpleado(item.empleado, m.nombre));
+                const eventBody = {
+                  subject:  `${item.empleado} - ${item.tipo}${item.destino ? ': ' + item.destino : ''}`,
+                  showAs:   esTipoCon ? 'busy' : 'free',
+                  isAllDay: !esTramo,
+                  start: esTramo
+                    ? { dateTime: `${item.fechaInicio}T${item.horaInicio}:00`, timeZone: 'Europe/Madrid' }
+                    : { dateTime: `${item.fechaInicio}T00:00:00`, timeZone: 'UTC' },
+                  end: esTramo
+                    ? { dateTime: `${item.fechaFin}T${item.horaFin}:00`, timeZone: 'Europe/Madrid' }
+                    : { dateTime: `${addDay(item.fechaFin)}T00:00:00`, timeZone: 'UTC' },
+                  // Solo privado y con asistentes para Asuntos propios / Otro
+                  ...(esTipoCon && {
+                    sensitivity: 'private',
+                    attendees: [
+                      ...(miembro?.email ? [{ emailAddress: { address: miembro.email, name: item.empleado }, type: 'required' }] : []),
+                      ...(user?.mail     ? [{ emailAddress: { address: user.mail, name: user.displayName }, type: 'required' }] : []),
+                    ],
+                  }),
+                };
+                const ev = await graph('POST', `/groups/${CONFIG.calendarGroupId}/events`, eventBody);
+                const sid = await getSiteId();
+                const lid = await getListId();
+                await graph('PATCH', `/sites/${sid}/lists/${lid}/items/${id}/fields`, {
+                  EventoCalendario: true,
+                  EventoID: ev.id,
+                });
+              } catch(e) {
+                console.error('Evento de calendario no creado:', e);
+                alert('⚠️ El evento de calendario no se pudo crear:\n' + (e?.message || JSON.stringify(e)));
+              }
+            }
+          } else {
+            await updateEstado(id, ST.RECHAZADO);
+          }
+          onRefresh();
+        } catch (err) {
+          console.error(err);
+          alert('Error al actualizar. Inténtalo de nuevo.');
+        }
+        setBusy(b => ({ ...b, [id]: false }));
+      };
+
+      return (
+        <div className="p-4">
+          <h2 className="text-lg font-bold text-gray-800 mb-1">Aprobaciones</h2>
+          <p className="text-sm text-gray-500 mb-4">
+            {esPre && !esFinal && 'Pre-aprobaciones (Begoña → CIO)'}
+            {esFinal && !esPre && 'Aprobaciones finales (CIO)'}
+            {esPre && esFinal  && 'Pre-aprobaciones y aprobaciones finales'}
+          </p>
+
+          {pendientes.length === 0 ? (
+            <div className="text-center py-16 text-gray-400">
+              <div className="text-4xl mb-3">🎉</div>
+              <p className="text-sm">No hay solicitudes pendientes</p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {pendientes.map(it => (
+                <div key={it.id} className="card p-4">
+                  <div className="flex items-start justify-between mb-2">
+                    <div>
+                      <p className="font-semibold text-gray-800">{it.empleado}</p>
+                      <p className="text-sm text-gray-600">{it.tipo}{it.destino ? `: ${it.destino}` : ''}</p>
+                      <p className="text-xs text-gray-400 mt-0.5">
+                        {fmtDate(it.fechaInicio)} → {fmtDate(it.fechaFin)}
+                        <span className="ml-1">({countDays(it.fechaInicio, it.fechaFin)} días)</span>
+                      </p>
+                    </div>
+                    <Badge estado={it.estado} />
+                  </div>
+                  <div className="flex gap-2 mt-3">
+                    <button
+                      onClick={() => accion(it.id, true)}
+                      disabled={!!busy[it.id]}
+                      className="flex-1 text-white font-semibold rounded-xl py-2 text-sm transition-opacity disabled:opacity-50"
+                      style={{ background: '#16A34A' }}>
+                      {busy[it.id] ? '...' : it.estado === ST.PENDIENTE ? '✓ Pre-aprobar' : '✓ Aprobar'}
+                    </button>
+                    <button
+                      onClick={() => accion(it.id, false)}
+                      disabled={!!busy[it.id]}
+                      className="flex-1 text-white font-semibold rounded-xl py-2 text-sm transition-opacity disabled:opacity-50"
+                      style={{ background: '#DC2626' }}>
+                      ✗ Rechazar
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  🚀  APP PRINCIPAL
+    // ════════════════════════════════════════════════════════════════════
+    function App() {
+      const [auth, setAuth]     = React.useState('loading'); // loading | out | in
+      const [user, setUser]     = React.useState(null);
+      const [spUserId, setSpUserId] = React.useState(null);
+      const [items, setItems]   = React.useState([]);
+      const [page, setPage]     = React.useState('home');
+      const [dataErr, setDataErr] = React.useState('');
+
+      // Inicialización MSAL
+      React.useEffect(() => {
+        if (!isConfigured) { setAuth('setup'); return; }
+
+        msalApp.handleRedirectPromise()
+          .then(response => {
+            if (response) msalApp.setActiveAccount(response.account);
+            const accounts = msalApp.getAllAccounts();
+            if (accounts.length > 0) {
+              msalApp.setActiveAccount(accounts[0]);
+              loadUser();
+            } else {
+              setAuth('out');
+            }
+          })
+          .catch(err => {
+            console.error('MSAL redirect error:', err);
+            setAuth('out');
+          });
+      }, []);
+
+      async function loadUser() {
+        try {
+          const token = await getToken();
+          const res = await fetch('https://graph.microsoft.com/v1.0/me', {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          const u = await res.json();
+          setUser(u);
+          setAuth('in');
+          // Obtener SP user ID en paralelo con los items
+          getSpUserId(u.mail).then(setSpUserId).catch(() => {});
+          loadItems();
+        } catch (err) {
+          console.error('loadUser error:', err);
+          setAuth('out');
+        }
+      }
+
+      async function loadItems() {
+        setDataErr('');
+        try {
+          const data = await fetchItems();
+          setItems(data);
+        } catch (err) {
+          console.error('loadItems error:', err);
+          setDataErr('Error al cargar datos de SharePoint.');
+        }
+      }
+
+      const login  = () => msalApp.loginRedirect({ scopes: SCOPES });
+      const logout = () => msalApp.logoutRedirect();
+
+      // ── Renders condicionales ──
+      if (auth === 'setup')   return <SetupScreen />;
+      if (auth === 'loading') return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-50">
+          <div className="text-center">
+            <div className="text-3xl mb-2">⏳</div>
+            <p className="text-gray-500 text-sm">Iniciando sesión...</p>
+          </div>
+        </div>
+      );
+      if (auth === 'out') return <LoginScreen onLogin={login} />;
+
+      const email    = user?.mail?.toLowerCase();
+      const adminUser = isAnyAdmin(email);
+
+      return (
+        <div className="min-h-screen bg-gray-50">
+          <TopBar user={user} onLogout={logout} />
+
+          {/* Error de datos */}
+          {dataErr && (
+            <div className="mx-4 mt-3 bg-red-50 border border-red-200 text-red-700 rounded-xl p-3 text-sm">
+              {dataErr} <button onClick={loadItems} className="underline ml-1">Reintentar</button>
+            </div>
+          )}
+
+          {/* Contenido — con padding-bottom para el nav */}
+          <div className="pb-24">
+            {page === 'home'       && <HomePage        items={items} user={user} />}
+            {page === 'nueva'      && <NuevaSolicitudPage user={user} spUserId={spUserId} onSubmit={loadItems} items={items} />}
+            {page === 'mis'        && <MisSolicitudesPage items={items} user={user} onRefresh={loadItems} />}
+            {page === 'calendario' && <CalendarioPage  items={items} />}
+            {page === 'aprobar' && adminUser && (
+              <AprobacionesPage items={items} user={user} onRefresh={loadItems} />
+            )}
+          </div>
+
+          <BottomNav page={page} setPage={setPage} adminUser={adminUser} />
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
