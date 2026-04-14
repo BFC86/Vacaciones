@@ -283,6 +283,23 @@
       return graph('POST', `/sites/${sid}/lists/${lid}/items`, { fields });
     }
 
+    async function sendMail(to, subject, bodyHtml) {
+      try {
+        await graph('POST', '/me/sendMail', {
+          message: {
+            subject,
+            body: { contentType: 'HTML', content: bodyHtml },
+            toRecipients: (Array.isArray(to) ? to : [to]).map(addr => ({
+              emailAddress: { address: addr }
+            })),
+          },
+          saveToSentItems: false,
+        });
+      } catch(e) {
+        console.warn('Email no enviado:', e);
+      }
+    }
+
     async function updateEstado(itemId, nuevoEstado) {
       const sid = await getSiteId();
       const lid = await getListId();
@@ -664,6 +681,19 @@
             horaFin:      (tieneHoras && !form.todoElDia) ? form.horaFin    : null,
           });
           setMsg({ type: 'ok', text: '✅ Solicitud enviada. Pendiente de aprobación.' });
+          // Notificar a pre-aprobadores
+          const detalleEmail = `${form.tipo}${form.destino ? ': ' + form.destino : ''} · ${fmtDate(form.inicio)}${form.inicio !== form.fin ? ' → ' + fmtDate(form.fin) : ''}`;
+          sendMail(
+            CONFIG.preApprovers,
+            `[Vacaciones] Nueva solicitud de ${user.displayName}`,
+            `<p>Hola,</p>
+             <p><b>${user.displayName}</b> ha enviado una nueva solicitud de ausencia:</p>
+             <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px">
+               <tr><td style="padding:6px 12px;color:#6b7280">Tipo</td><td style="padding:6px 12px"><b>${form.tipo}${form.destino ? ': ' + form.destino : ''}</b></td></tr>
+               <tr style="background:#f9fafb"><td style="padding:6px 12px;color:#6b7280">Fechas</td><td style="padding:6px 12px">${fmtDate(form.inicio)}${form.inicio !== form.fin ? ' → ' + fmtDate(form.fin) : ''}</td></tr>
+             </table>
+             <p style="margin-top:16px"><a href="https://bfc86.github.io/Vacaciones/vacaciones-app.html" style="background:#2563eb;color:white;padding:10px 20px;border-radius:8px;text-decoration:none">Revisar solicitud</a></p>`
+          );
           setForm({ tipo: 'Vacaciones', inicio: '', fin: '', destino: '', todoElDia: true, horaInicio: '09:00', horaFin: '18:00' });
           onSubmit();
         } catch (err) {
@@ -1129,6 +1159,57 @@
 
             await updateEstado(id, siguiente);
 
+            // Notificaciones por email
+            const fechasStr = `${fmtDate(item.fechaInicio)}${item.fechaInicio !== item.fechaFin ? ' → ' + fmtDate(item.fechaFin) : ''}`;
+            const tipoStr   = `${item.tipo}${item.destino ? ': ' + item.destino : ''}`;
+            const appUrl    = 'https://bfc86.github.io/Vacaciones/vacaciones-app.html';
+            if (siguiente === ST.PRE) {
+              // Pre-aprobada → avisar a aprobadores finales
+              sendMail(
+                CONFIG.finalApprovers,
+                `[Vacaciones] Solicitud pre-aprobada de ${item.empleado}`,
+                `<p>Hola,</p>
+                 <p>La solicitud de <b>${item.empleado}</b> ha sido pre-aprobada y está pendiente de tu aprobación final:</p>
+                 <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px">
+                   <tr><td style="padding:6px 12px;color:#6b7280">Tipo</td><td style="padding:6px 12px"><b>${tipoStr}</b></td></tr>
+                   <tr style="background:#f9fafb"><td style="padding:6px 12px;color:#6b7280">Fechas</td><td style="padding:6px 12px">${fechasStr}</td></tr>
+                 </table>
+                 <p style="margin-top:16px"><a href="${appUrl}" style="background:#2563eb;color:white;padding:10px 20px;border-radius:8px;text-decoration:none">Aprobar solicitud</a></p>`
+              );
+            } else if (siguiente === ST.APROBADO) {
+              // Aprobada → avisar al empleado
+              const miembro = EQUIPO.find(m => matchEmpleado(item.empleado, m.nombre));
+              if (miembro?.email) {
+                sendMail(
+                  miembro.email,
+                  `[Vacaciones] Tu solicitud ha sido aprobada`,
+                  `<p>Hola ${item.empleado.split(' ')[0]},</p>
+                   <p>Tu solicitud de ausencia ha sido <b style="color:#16a34a">aprobada</b>:</p>
+                   <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px">
+                     <tr><td style="padding:6px 12px;color:#6b7280">Tipo</td><td style="padding:6px 12px"><b>${tipoStr}</b></td></tr>
+                     <tr style="background:#f9fafb"><td style="padding:6px 12px;color:#6b7280">Fechas</td><td style="padding:6px 12px">${fechasStr}</td></tr>
+                   </table>
+                   <p style="margin-top:16px"><a href="${appUrl}" style="background:#2563eb;color:white;padding:10px 20px;border-radius:8px;text-decoration:none">Ver mis solicitudes</a></p>`
+                );
+              }
+            } else if (siguiente === ST.RECHAZADO) {
+              // Rechazada → avisar al empleado
+              const miembro = EQUIPO.find(m => matchEmpleado(item.empleado, m.nombre));
+              if (miembro?.email) {
+                sendMail(
+                  miembro.email,
+                  `[Vacaciones] Tu solicitud no ha sido aprobada`,
+                  `<p>Hola ${item.empleado.split(' ')[0]},</p>
+                   <p>Tu solicitud de ausencia no ha podido ser aprobada:</p>
+                   <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px">
+                     <tr><td style="padding:6px 12px;color:#6b7280">Tipo</td><td style="padding:6px 12px"><b>${tipoStr}</b></td></tr>
+                     <tr style="background:#f9fafb"><td style="padding:6px 12px;color:#6b7280">Fechas</td><td style="padding:6px 12px">${fechasStr}</td></tr>
+                   </table>
+                   <p style="color:#6b7280;font-size:13px">Si tienes dudas, contacta con tu responsable.</p>`
+                );
+              }
+            }
+
             // Aprobación final → la app crea el evento (PA desactivado)
             if (siguiente === ST.APROBADO) {
               try {
@@ -1168,7 +1249,24 @@
               }
             }
           } else {
+            const item = items.find(i => i.id === id);
             await updateEstado(id, ST.RECHAZADO);
+            const miembro = EQUIPO.find(m => matchEmpleado(item.empleado, m.nombre));
+            if (miembro?.email) {
+              const fechasStr = `${fmtDate(item.fechaInicio)}${item.fechaInicio !== item.fechaFin ? ' → ' + fmtDate(item.fechaFin) : ''}`;
+              const tipoStr   = `${item.tipo}${item.destino ? ': ' + item.destino : ''}`;
+              sendMail(
+                miembro.email,
+                `[Vacaciones] Tu solicitud no ha sido aprobada`,
+                `<p>Hola ${item.empleado.split(' ')[0]},</p>
+                 <p>Tu solicitud de ausencia no ha podido ser aprobada:</p>
+                 <table style="border-collapse:collapse;font-family:sans-serif;font-size:14px">
+                   <tr><td style="padding:6px 12px;color:#6b7280">Tipo</td><td style="padding:6px 12px"><b>${tipoStr}</b></td></tr>
+                   <tr style="background:#f9fafb"><td style="padding:6px 12px;color:#6b7280">Fechas</td><td style="padding:6px 12px">${fechasStr}</td></tr>
+                 </table>
+                 <p style="color:#6b7280;font-size:13px">Si tienes dudas, contacta con tu responsable.</p>`
+              );
+            }
           }
           onRefresh();
         } catch (err) {
