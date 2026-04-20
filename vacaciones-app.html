@@ -45,7 +45,7 @@
 
       // Roles de aprobación  →  pon los emails de Microsoft de cada persona
       preApprovers: ['bf@caroloinvestment.com'],           // 1ª aprobación (Bego)
-      finalApprovers: ['bf@caroloinvestment.com'],          // 2ª aprobación (provisional — cambiar por email de CIO)
+      finalApprovers: ['nb@caroloinvestment.com'],           // 2ª aprobación (Nieves Benito)
 
       // ID del grupo de Office 365 donde se crea el calendario (Vacaciones Carolo Investments)
       calendarGroupId: '227d6ee6-bb5f-4c88-936d-297bb91a51eb',
@@ -145,7 +145,7 @@
     // ════════════════════════════════════════════════════════════════════
     //  🔐  MSAL
     // ════════════════════════════════════════════════════════════════════
-    const SCOPES = ['User.Read', 'Sites.ReadWrite.All', 'Calendars.ReadWrite'];
+    const SCOPES = ['User.Read', 'Sites.ReadWrite.All', 'Calendars.ReadWrite', 'Mail.Send'];
 
     let msalApp = null;
     const isConfigured = CONFIG.clientId !== 'TU_CLIENT_ID' && CONFIG.tenantId !== 'TU_TENANT_ID';
